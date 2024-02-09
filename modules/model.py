@@ -1,3 +1,5 @@
+from modules.dataset import batch_generator
+
 import torch
 from torch.nn import Module, GRU, Linear, CrossEntropyLoss
 import torch.nn.functional as F
@@ -40,19 +42,18 @@ class Discriminator(Module):
         y = self.gru(x)
         y = torch.flatten(y, start_dim=1)
         y = self.fc(y)
-        return F.sigmoid(y)
+        return y
 
 def generate_then_discriminate(model, batch_size, seq_len, criterion, target, device):
     z = torch.randn((batch_size, seq_len), device=device)
     syn = model.generator(z)
-    
-    label = torch.full((batch_size,), target, device=device)
     d_pred = model.discriminator(syn)
-    err = criterion(d_pred, label)
+    err = criterion(d_pred, target)
     return err
 
 def train(model, train_data, batch_size, seq_len, g_solver, d_solver, criterion, device):
     real_label, fake_label = 1, 0
+    label = torch.full((batch_size,), target, device=device)
 
     # Generator Training
     model.generator.train(True)
@@ -60,11 +61,12 @@ def train(model, train_data, batch_size, seq_len, g_solver, d_solver, criterion,
     
     for g_step in range(2):
         g_solver.zero_grad()
+        label.fill_(real_label)
         err_G = generate_then_discriminate(model, 
                                            batch_size, 
                                            seq_len, 
                                            criterion, 
-                                           real_label, 
+                                           label, 
                                            device)
         err_G.backward()
         g_solver.step()
@@ -74,18 +76,19 @@ def train(model, train_data, batch_size, seq_len, g_solver, d_solver, criterion,
     model.discriminator.train(True)
 
     d_solver.zero_grad()
+    label.fill_(fake_label)
     err_fake = generate_then_discriminate(model, 
                                           batch_size, 
                                           seq_len, 
                                           criterion, 
-                                          fake_label,
+                                          label,
                                           device)
     
     real = batch_generator(train_data, batch_size)
     real = real.to(device)
     
     d_pred = model.discriminator(real)
-    label = torch.full((batch_size,), real_label, device=device)
+    label.fill_(real_label)
     err_real = criterion(d_pred, label)
 
     err_D = torch.mean(err_real.item(), err_fake.item())
@@ -118,5 +121,3 @@ class DNA_GAN(Module):
                 wandb.log(meta)
 
         return None
-
-        
