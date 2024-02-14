@@ -1,7 +1,5 @@
-from modules.dataset import batch_generator
-
 import torch
-from torch.nn import Module, GRU, Linear, CrossEntropyLoss
+from torch.nn import Module, GRU, Linear
 import torch.nn.functional as F
 from torch.optim import Adam
 
@@ -9,22 +7,42 @@ from tqdm import tqdm
 import wandb
 
 class Generator(Module):
-    def __init__(self, hidden_size, num_layers):
+    def __init__(self, hidden_size, num_layers, seq_len):
         self.gru = GRU(input_size=1, 
                        hidden_size=hidden_size, 
                        num_layers=num_layers, 
+                       bidirectional=True,
                        batch_first=True)
         
-        self.fc = Linear(in_features=hidden_size, 
-                         out_features=1)
+        in_features = 2*hidden_size
+        self.fc = Linear(in_features=in_features, out_features=1)
+        
+        self.seq_len = seq_len
 
-    def forward(self, x):
+    def forward(self, x, supervised=False):
+        y = self.unsupervised(x) if not supervised else self.supervised(x)
+        return y
+
+    def unsupervised(self, x):
         y, y_hat = self.gru(x), []
         for y_t in torch.split(y, 1, dim=1):
             y_hat_t = self.fc(y_t)
             y_hat.append(y_hat_t)
 
         y_hat = torch.cat(y_hat, dim=1) 
+        return F.sigmoid(y_hat)
+
+    def supervised(self, x):
+        y_hat = []
+        for i in range(self.seq_len):
+            x_hat = x.clone()
+            x_hat[:, i, :] = torch.randn((1,), device=x.get_device())
+            y = self.gru(x_hat)
+            y = self.fc(y[:, i, :])
+
+            y_hat.append(y)
+        
+        y_hat = torch.cat(y_hat, dim=1)
         return F.sigmoid(y_hat)
 
 class Discriminator(Module):
@@ -44,61 +62,6 @@ class Discriminator(Module):
         y = self.fc(y)
         return y
 
-def generate_then_discriminate(model, batch_size, seq_len, criterion, target, device):
-    z = torch.randn((batch_size, seq_len), device=device)
-    syn = model.generator(z)
-    d_pred = model.discriminator(syn)
-    err = criterion(d_pred, target)
-    return err
-
-def train(model, train_data, batch_size, seq_len, g_solver, d_solver, criterion, device):
-    real_label, fake_label = 1, 0
-    label = torch.full((batch_size,), target, device=device)
-
-    # Generator Training
-    model.generator.train(True)
-    model.discriminator.eval()
-    
-    for g_step in range(2):
-        g_solver.zero_grad()
-        label.fill_(real_label)
-        err_G = generate_then_discriminate(model, 
-                                           batch_size, 
-                                           seq_len, 
-                                           criterion, 
-                                           label, 
-                                           device)
-        err_G.backward()
-        g_solver.step()
-
-    # Discriminator Training
-    model.generator.eval()
-    model.discriminator.train(True)
-
-    d_solver.zero_grad()
-    label.fill_(fake_label)
-    err_fake = generate_then_discriminate(model, 
-                                          batch_size, 
-                                          seq_len, 
-                                          criterion, 
-                                          label,
-                                          device)
-    
-    real = batch_generator(train_data, batch_size)
-    real = real.to(device)
-    
-    d_pred = model.discriminator(real)
-    label.fill_(real_label)
-    err_real = criterion(d_pred, label)
-
-    err_D = torch.mean(err_real.item(), err_fake.item())
-    if err_D > 0.15:
-        err_fake.backward()
-        err_real.backward()
-        d_solver.step()
-
-    return model, err_G, err_D
-
 class DNA_GAN(Module):
     def __init__(self, hidden_size, num_layers, seq_len):
         self.seq_len = seq_len
@@ -108,16 +71,78 @@ class DNA_GAN(Module):
         self.generator = Generator(hidden_size, num_layers)
         self.discriminator = Discriminator(hidden_size, num_layers, seq_len)
 
-    def fit(self, train_data, lr, iters, device, save_to_wandb):
-        criterion = CrossEntropyLoss()
-        d_solver = Adam(self.discriminator.parameters(), lr=lr)
-        g_solver = Adam(self.generator.parameters(), lr=lr)
+    def fit(self, dataloader, lr, batch_size, device, log_wandb):
+        self.real_tag, self.fake_tag = 1, 0
+        self.label = torch.full((batch_size,), self.real_tag, device=device)
 
-        for iter in tqdm(range(iters), desc='Training'):
-            model, err_G, err_D = train(model, train_data, batch_size, seq_len, g_solver, d_solver, criterion, device)
+        self.d_solver = Adam(self.discriminator.parameters(), lr=lr)
+        self.g_solver = Adam(self.generator.parameters(), lr=lr)
 
-            meta = {'d_loss': err_D, 'g_loss': err_G}
-            if save_to_wandb:
-                wandb.log(meta)
+        with tqdm(dataloader, desc='Training') as tepoch:
+            for i, re_batch in enumerate(tepoch):
+                re_batch = re_batch.to(device)
+                
+                # Train Generator
+                self.generator.train(True)
+                self.discriminator.eval()
+                z = torch.randn((batch_size, self.seq_len), device=device)
+                g_u_err = self.g_step_unsuper(z)
+                g_s_err = self.g_step_super(re_batch)
 
+                # Train Discriminator
+                self.generator.eval()
+                self.discriminator.train(True)
+                z = torch.randn((batch_size, self.seq_len), device=device)
+                d_err = self.d_step(re_batch, z, threshold=0)
+
+                meta = {'d_loss': d_err, 
+                        'g_unsuper_loss': g_u_err, 
+                        'g_super_loss': g_s_err, 
+                        'iter': i}
+                if log_wandb:
+                    wandb.log(meta)
         return None
+    
+    def g_step_unsuper(self, x):
+        self.label.fill_(self.real_tag)
+        
+        self.g_solver.zero_grad()
+
+        syn = self.generator(x, supervised=False)
+        d_pred = self.discriminator(syn)
+        err = F.cross_entropy(d_pred, self.label)
+
+        err.backward()
+        self.g_solver.step()
+        return err
+    
+    def g_step_super(self, x):
+        self.g_solver.zero_grad()
+
+        syn = self.generator(x, supervised=True)
+
+        batch_size = x.shape[0]
+        err = F.l1_loss(syn, x, reduction='sum') / batch_size
+
+        err.backward()
+        self.g_solver.step()
+        return err
+    
+    def d_step(self, real, latent, threshold):
+        self.d_solver.zero_grad()
+
+        self.label.fill_(self.fake_tag)
+        syn = self.generator(latent, supervised=False)
+        d_pred = self.discriminator(syn)
+        err_fk = F.cross_entropy(d_pred, self.label)
+
+        self.label.fill_(self.real_tag)
+        d_pred = self.discriminator(real)
+        err_re = F.cross_entropy(d_pred, self.label)
+
+        err = torch.mean(err_fk, err_re)
+        if err > threshold:
+            err_fk.backward()
+            err_re.backward()
+            self.d_solver.step()
+        return err
