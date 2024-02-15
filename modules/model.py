@@ -50,10 +50,12 @@ class Generator(Module):
         z = torch.randn(size=x.size(), device=x.get_device())
 
         x_hat = x.clone()
-        x_hat[mask] = z[mask]
+        x_hat[mask] = z[mask] # corrupt step
+        
         y = self.gru(x_hat)
-        y = self.fc(y[mask])
-        return x[mask], F.sigmoid(y)
+        y = torch.flatten(y, start_dim=1)
+        y = self.fc(y)
+        return x[mask], F.sigmoid(y[mask])
 
 class Discriminator(Module):
     def __init__(self, hidden_size, num_layers, seq_len):
