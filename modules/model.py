@@ -20,7 +20,7 @@ class Generator(Module):
         self.seq_len = seq_len
 
     def forward(self, x, supervised=False):
-        y = self.unsupervised(x) if not supervised else self.supervised(x)
+        y = self.unsupervised(x) if not supervised else self.single_cell_supervised(x)
         return y
 
     def unsupervised(self, x):
@@ -32,7 +32,7 @@ class Generator(Module):
         y_hat = torch.cat(y_hat, dim=1) 
         return F.sigmoid(y_hat)
 
-    def supervised(self, x):
+    def single_cell_supervised(self, x): # iterative single step prediction
         y_hat = []
         for i in range(self.seq_len):
             x_hat = x.clone()
@@ -44,6 +44,16 @@ class Generator(Module):
         
         y_hat = torch.cat(y_hat, dim=1)
         return F.sigmoid(y_hat)
+    
+    def multi_cell_supervised(self, x): # 'one go' multiple steps prediction
+        mask = torch.randint(high=2, size=x.size()) == 1
+        z = torch.randn(size=x.size(), device=x.get_device())
+
+        x_hat = x.clone()
+        x_hat[mask] = z[mask]
+        y = self.gru(x_hat)
+        y = self.fc(y[mask])
+        return x[mask], F.sigmoid(y)
 
 class Discriminator(Module):
     def __init__(self, hidden_size, num_layers, seq_len):
